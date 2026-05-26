@@ -20,7 +20,7 @@ N_SAMPLES = 20
 TEMPERATURE = 0.5
 NUM_STEPS = 8
 
-FINALIST_THRESHOLD = 0.6
+FINALIST_THRESHOLD = 0.65
 
 def create_model(model_name=MODEL_NAME, token=None):
     if token is None:
