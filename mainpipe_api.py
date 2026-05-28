@@ -86,8 +86,7 @@ def masked_positions(seq):
 def generate_predictions(model, masked_seq):
     preds = []
 
-    for _ in range(N_SAMPLES):
-
+    for i in range(N_SAMPLES):
         protein = ESMProtein(sequence=masked_seq)
 
         out = model.generate(
@@ -98,6 +97,9 @@ def generate_predictions(model, masked_seq):
                 num_steps=NUM_STEPS
             )
         )
+
+        if not hasattr(out, "sequence"):
+            raise RuntimeError(f"ESM generation failed at sample {i+1}: {out}")
 
         preds.append(out.sequence)
 
