@@ -1,4 +1,4 @@
-```python
+
 # =========================
 # IMPORTS
 # =========================
@@ -450,4 +450,4 @@ if __name__ == "__main__":
     merged, final = run_api_pipeline(
         "MVLSEGEWQLVLHVWAKVE..."
     )
-```
+
