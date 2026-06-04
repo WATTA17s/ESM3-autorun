@@ -38,21 +38,20 @@ MASTER_LOG = OUTPUT_DIR / "full_pipeline_log.txt"
 # =========================
 # MODEL
 # =========================
+from esm.sdk.forge import ESM3ForgeInferenceClient
+
 def create_model(model_name=MODEL_NAME, token=None):
-    """
-    Create ESM API client.
-    For Colab, you can pass token directly:
-        model = create_model(token="YOUR_API_KEY")
-    or leave token=None and enter it securely when prompted.
-    """
+
     if token is None:
         token = getpass("Enter ESM API key: ")
 
-    print("esm version:", esm.__version__)
-    print("model:", model_name)
+    client = ESM3ForgeInferenceClient(
+        model=model_name,
+        url="https://biohub.ai",
+        token=token,
+    )
 
-    return esm.sdk.client(model_name, token=token)
-
+    return client
 
 # =========================
 # FILE HELPERS
