@@ -11,6 +11,7 @@ import json
 
 import esm
 from esm.sdk.api import ESMProtein, GenerationConfig
+from esm3_esmc_crosscheck import run_esmc_crosscheck_for_esm3_mutations
 
 
 # =========================
@@ -476,330 +477,9 @@ def build_finalist_seq(
 
 
 # =========================
-# ESM3 SUMMARY HEATMAP
-# =========================
-def make_esm3_summary_heatmap(
-    ref_seq,
-    strict_mutations,
-    final_merged,
-    final_seq,
-    final_report_rows,
-    output_dir=OUTPUT_DIR
-):
-    """
-    Build one full-sequence heatmap from the pipeline run itself.
-
-    Rows:
-        WT
-        Mask_consensus
-        Final_merge
-        Vote_winner
-        Final_seq
-
-    No extra candidate input is required.
-
-    Symbols:
-        ★ = accepted / strong mutation signal
-        ✓ = vote winner supports accepted final residue
-        × = vote winner conflicts with final decision or was rejected
-        · = suggested/voted mutation was reverted to WT
-        _ = masked memory position
-    """
-
-    output_dir = Path(output_dir)
-    fig_dir = output_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
-
-    final_report_by_pos = {
-        int(row["position_1based"]): row
-        for row in final_report_rows
-    }
-
-    positions = list(range(1, len(ref_seq) + 1))
-
-    # ------------------------------------------------------------
-    # Position-level summary table
-    # ------------------------------------------------------------
-    summary_rows = []
-
-    for pos in positions:
-        idx = pos - 1
-        wt = ref_seq[idx]
-        final_merge_char = final_merged[idx]
-        final_residue = final_seq[idx]
-
-        strict_aas = sorted(list(strict_mutations.get(idx, set())))
-        strict_memory = ",".join(strict_aas)
-
-        report = final_report_by_pos.get(pos, {})
-        vote_winner = report.get("vote_winner", wt)
-        vote_count = report.get("vote_count", "")
-        total_votes = report.get("total_votes", "")
-        vote_frequency = report.get("vote_frequency", "")
-        decision = report.get("decision", "WT_NO_MASK")
-
-        if strict_aas:
-            mask_consensus = "/".join(strict_aas)
-        else:
-            mask_consensus = wt
-
-        summary_rows.append({
-            "position_1based": pos,
-            "wt": wt,
-            "mask_consensus": mask_consensus,
-            "strict_memory": strict_memory,
-            "final_merge": final_merge_char,
-            "vote_winner": vote_winner,
-            "vote_count": vote_count,
-            "total_votes": total_votes,
-            "vote_frequency": vote_frequency,
-            "final_residue": final_residue,
-            "decision": decision
-        })
-
-    save_csv(
-        output_dir / "esm3_summary_heatmap_position_table.csv",
-        summary_rows,
-        [
-            "position_1based",
-            "wt",
-            "mask_consensus",
-            "strict_memory",
-            "final_merge",
-            "vote_winner",
-            "vote_count",
-            "total_votes",
-            "vote_frequency",
-            "final_residue",
-            "decision"
-        ]
-    )
-
-    # ------------------------------------------------------------
-    # Build heatmap matrices
-    # ------------------------------------------------------------
-    row_names = [
-        "WT",
-        "Mask_consensus",
-        "Final_merge",
-        "Vote_winner",
-        "Final_seq"
-    ]
-
-    label_matrix = []
-    score_matrix = []
-
-    # Row 1: WT
-    wt_labels = []
-    wt_scores = []
-
-    for pos in positions:
-        wt_labels.append(ref_seq[pos - 1])
-        wt_scores.append(1)
-
-    label_matrix.append(wt_labels)
-    score_matrix.append(wt_scores)
-
-    # Row 2: Mask consensus / strict mutation memory
-    mask_consensus_labels = []
-    mask_consensus_scores = []
-
-    for pos in positions:
-        idx = pos - 1
-        wt = ref_seq[idx]
-        strict_aas = sorted(list(strict_mutations.get(idx, set())))
-
-        if strict_aas:
-            label = "/".join(strict_aas) + "★"
-            score = 2
-        else:
-            label = wt
-            score = 1
-
-        mask_consensus_labels.append(label)
-        mask_consensus_scores.append(score)
-
-    label_matrix.append(mask_consensus_labels)
-    score_matrix.append(mask_consensus_scores)
-
-    # Row 3: Final merge / memory-masked sequence
-    final_merge_labels = []
-    final_merge_scores = []
-
-    for pos in positions:
-        ch = final_merged[pos - 1]
-
-        if ch == MASK_CHAR:
-            final_merge_labels.append(MASK_CHAR)
-            final_merge_scores.append(0)
-        else:
-            final_merge_labels.append(ch)
-            final_merge_scores.append(1)
-
-    label_matrix.append(final_merge_labels)
-    score_matrix.append(final_merge_scores)
-
-    # Row 4: Vote winner from final-stage voting
-    vote_labels = []
-    vote_scores = []
-
-    for pos in positions:
-        idx = pos - 1
-        wt = ref_seq[idx]
-        final_residue = final_seq[idx]
-        report = final_report_by_pos.get(pos, None)
-
-        if report is None:
-            vote_labels.append(wt)
-            vote_scores.append(1)
-
-        else:
-            vote_winner = report["vote_winner"]
-            decision = report["decision"]
-
-            if decision == "ACCEPT" and vote_winner == final_residue and final_residue != wt:
-                vote_labels.append(vote_winner + "✓")
-                vote_scores.append(3)
-
-            elif decision == "REVERT_TO_WT" and vote_winner != wt:
-                vote_labels.append(vote_winner + "×")
-                vote_scores.append(-1)
-
-            elif vote_winner == wt:
-                vote_labels.append(vote_winner)
-                vote_scores.append(1)
-
-            else:
-                vote_labels.append(vote_winner + "×")
-                vote_scores.append(-1)
-
-    label_matrix.append(vote_labels)
-    score_matrix.append(vote_scores)
-
-    # Row 5: Final sequence
-    final_labels = []
-    final_scores = []
-
-    for pos in positions:
-        idx = pos - 1
-        wt = ref_seq[idx]
-        final_residue = final_seq[idx]
-        report = final_report_by_pos.get(pos, None)
-
-        if final_residue != wt:
-            final_labels.append(final_residue + "★")
-            final_scores.append(3)
-
-        elif report is not None and report.get("decision") == "REVERT_TO_WT":
-            final_labels.append(wt + "·")
-            final_scores.append(0)
-
-        else:
-            final_labels.append(wt)
-            final_scores.append(1)
-
-    label_matrix.append(final_labels)
-    score_matrix.append(final_scores)
-
-    # ------------------------------------------------------------
-    # Save heatmap CSV files
-    # ------------------------------------------------------------
-    labels_path = output_dir / "esm3_summary_heatmap_labels.csv"
-    scores_path = output_dir / "esm3_summary_heatmap_scores.csv"
-
-    with open(labels_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer"] + [str(p) for p in positions])
-        for name, labels in zip(row_names, label_matrix):
-            writer.writerow([name] + labels)
-
-    with open(scores_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["layer"] + [str(p) for p in positions])
-        for name, scores in zip(row_names, score_matrix):
-            writer.writerow([name] + scores)
-
-    # ------------------------------------------------------------
-    # Plot full-sequence heatmap
-    # ------------------------------------------------------------
-    try:
-        import matplotlib.pyplot as plt
-
-        n_rows = len(row_names)
-        n_cols = len(positions)
-
-        fig_w = max(18, n_cols * 0.24)
-        fig_h = max(4, n_rows * 0.55)
-
-        plt.figure(figsize=(fig_w, fig_h))
-
-        plt.imshow(
-            score_matrix,
-            aspect="auto",
-            vmin=-1,
-            vmax=3
-        )
-
-        plt.colorbar(label="Decision score")
-
-        plt.xticks(
-            ticks=range(n_cols),
-            labels=[str(p) for p in positions],
-            rotation=90
-        )
-
-        plt.yticks(
-            ticks=range(n_rows),
-            labels=row_names
-        )
-
-        if n_cols > 180:
-            font_size = 3
-        elif n_cols > 120:
-            font_size = 4
-        elif n_cols > 80:
-            font_size = 5
-        elif n_cols > 50:
-            font_size = 6
-        else:
-            font_size = 8
-
-        for i in range(n_rows):
-            for j in range(n_cols):
-                plt.text(
-                    j,
-                    i,
-                    str(label_matrix[i][j]),
-                    ha="center",
-                    va="center",
-                    fontsize=font_size
-                )
-
-        plt.xlabel("Position")
-        plt.ylabel("Pipeline layer")
-        plt.title("ESM3 Pipeline Summary Full-Sequence Heatmap")
-        plt.tight_layout()
-
-        fig_path = fig_dir / "esm3_summary_fullmatch_heatmap.png"
-        plt.savefig(fig_path, dpi=400)
-        plt.show()
-
-        print("\nSaved ESM3 summary heatmap:")
-        print(fig_path)
-
-    except ImportError:
-        print("\nmatplotlib is not installed, so only CSV heatmap tables were saved.")
-
-    print("Saved heatmap tables:")
-    print(output_dir / "esm3_summary_heatmap_position_table.csv")
-    print(labels_path)
-    print(scores_path)
-
-
-# =========================
 # MAIN PIPELINE
 # =========================
-def run_pipeline(model, ref_seq):
+def run_pipeline(model, ref_seq, token=None):
     ref_seq = clean_sequence(ref_seq)
     validate_reference_sequence(ref_seq)
 
@@ -1083,13 +763,18 @@ def run_pipeline(model, ref_seq):
         ]
     )
 
-    make_esm3_summary_heatmap(
+    # =========================
+    # STEP 6: ESMC cross-check for ESM3 accepted mutations
+    # =========================
+    run_esmc_crosscheck_for_esm3_mutations(
         ref_seq=ref_seq,
-        strict_mutations=strict_mutations,
-        final_merged=final_merged,
         final_seq=final,
         final_report_rows=final_report_rows,
-        output_dir=OUTPUT_DIR
+        token=token,
+        esmc_model_name="esmc-6b-2024-12",
+        fallback_model_name="esmc-600m-2024-12",
+        output_dir=OUTPUT_DIR,
+        make_heatmap=True
     )
 
     muts = mutation_string(ref_seq, final)
@@ -1133,8 +818,11 @@ def run_pipeline(model, ref_seq):
 # API WRAPPER
 # =========================
 def run_api_pipeline(ref_seq, token=None):
+    if token is None:
+        token = getpass("Enter ESM / Biohub API key: ")
+
     model = create_model(token=token)
-    return run_pipeline(model, ref_seq)
+    return run_pipeline(model, ref_seq, token=token)
 
 
 # =========================
