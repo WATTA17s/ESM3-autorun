@@ -3,6 +3,7 @@
 #
 # Mode 1: WT-only position scan
 # Mode 2: Compare candidate sequences against WT
+#         + full sequence-level match heatmap
 #
 # This script asks for:
 # - Biohub API token
@@ -412,6 +413,369 @@ def compare_variants_to_wt(
 
 
 # ============================================================
+# Full sequence-level ESMC match heatmap
+# ============================================================
+
+def parse_topk_cell(top_k_cell, n=3):
+    """
+    Parse top_k string like:
+    A:0.50000;V:0.20000;L:0.10000
+    """
+    if pd.isna(top_k_cell):
+        return []
+
+    items = []
+
+    for part in str(top_k_cell).split(";"):
+        part = part.strip()
+
+        if not part or ":" not in part:
+            continue
+
+        aa, prob = part.split(":", 1)
+
+        try:
+            items.append((aa.strip(), float(prob)))
+        except ValueError:
+            continue
+
+    return items[:n]
+
+
+def make_full_sequence_match_heatmap(
+    wt_seq: str,
+    variants: Dict[str, str],
+    wt_scan_df: pd.DataFrame,
+    detail_df: pd.DataFrame
+) -> None:
+    """
+    Create one full-sequence heatmap.
+
+    Rows:
+    - WT
+    - ESMC_top1
+    - candidate sequences
+
+    Columns:
+    - protein positions from 1 to final residue
+
+    Symbols:
+    ★ = candidate matches ESMC top1
+    ✓ = candidate matches ESMC top3
+    × = candidate mutation does not match ESMC suggestion
+    · = candidate keeps WT while ESMC suggests mutation
+    """
+
+    import matplotlib.pyplot as plt
+
+    outdir = "outputs"
+    figdir = os.path.join(outdir, "figures")
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(figdir, exist_ok=True)
+
+    wt_scan_df = wt_scan_df.copy()
+    wt_scan_df["position_1based"] = wt_scan_df["position_1based"].astype(int)
+
+    # ------------------------------------------------------------
+    # Build ESMC suggestion table
+    # ------------------------------------------------------------
+
+    suggestion_rows = []
+
+    for _, row in wt_scan_df.iterrows():
+        pos = int(row["position_1based"])
+        wt_aa = row["WT"]
+
+        top_items = parse_topk_cell(row["top_k"], n=3)
+
+        top1_aa = top_items[0][0] if len(top_items) >= 1 else row["top1_AA"]
+        top1_prob = top_items[0][1] if len(top_items) >= 1 else row["top1_prob"]
+
+        top2_aa = top_items[1][0] if len(top_items) >= 2 else ""
+        top2_prob = top_items[1][1] if len(top_items) >= 2 else np.nan
+
+        top3_aa = top_items[2][0] if len(top_items) >= 3 else ""
+        top3_prob = top_items[2][1] if len(top_items) >= 3 else np.nan
+
+        top3_set = "".join([aa for aa, prob in top_items])
+
+        if top1_aa == wt_aa:
+            suggestion_status = "WT_best"
+            suggested_AA = wt_aa
+        else:
+            suggestion_status = "ESMC_suggests_mutation"
+            suggested_AA = top1_aa
+
+        suggestion_rows.append({
+            "position_1based": pos,
+            "WT": wt_aa,
+            "WT_prob": row["WT_prob"],
+            "WT_rank": row["WT_rank"],
+            "entropy": row["entropy"],
+            "top1_AA": top1_aa,
+            "top1_prob": top1_prob,
+            "top2_AA": top2_aa,
+            "top2_prob": top2_prob,
+            "top3_AA": top3_aa,
+            "top3_prob": top3_prob,
+            "top3_set": top3_set,
+            "suggested_AA": suggested_AA,
+            "suggestion_status": suggestion_status
+        })
+
+    suggestion_df = pd.DataFrame(suggestion_rows)
+
+    suggestion_path = os.path.join(outdir, "esmc_position_suggestion_table.csv")
+    suggestion_df.to_csv(suggestion_path, index=False)
+
+    suggestion_map = suggestion_df.set_index("position_1based")
+
+    # ------------------------------------------------------------
+    # Build detail lookup for LLR
+    # ------------------------------------------------------------
+
+    detail_lookup = {}
+
+    if detail_df is not None and not detail_df.empty:
+        for _, row in detail_df.iterrows():
+            key = (row["variant_name"], int(row["position_1based"]))
+            detail_lookup[key] = row
+
+    # ------------------------------------------------------------
+    # Candidate match table
+    # ------------------------------------------------------------
+
+    candidate_rows = []
+
+    for variant_name, variant_seq in variants.items():
+
+        if len(variant_seq) != len(wt_seq):
+            raise ValueError(
+                f"{variant_name} length mismatch: "
+                f"WT={len(wt_seq)}, variant={len(variant_seq)}"
+            )
+
+        for pos in range(1, len(wt_seq) + 1):
+            wt_aa = wt_seq[pos - 1]
+            cand_aa = variant_seq[pos - 1]
+
+            srow = suggestion_map.loc[pos]
+            top1_aa = srow["top1_AA"]
+            top3_set = str(srow["top3_set"])
+
+            llr = np.nan
+            mut_prob = np.nan
+
+            if cand_aa != wt_aa:
+                drow = detail_lookup.get((variant_name, pos), None)
+
+                if drow is not None:
+                    llr = drow["LLR"]
+                    mut_prob = drow["MUT_prob"]
+
+            # Score and label logic
+            if cand_aa == wt_aa and top1_aa == wt_aa:
+                match_status = "KEEP_WT_AND_WT_IS_BEST"
+                score = 1
+                label = cand_aa
+
+            elif cand_aa == wt_aa and top1_aa != wt_aa:
+                match_status = "KEEP_WT_BUT_ESMC_SUGGESTS_MUTATION"
+                score = 0
+                label = cand_aa + "·"
+
+            elif cand_aa != wt_aa and cand_aa == top1_aa:
+                match_status = "MATCH_ESMC_TOP1"
+                score = 3
+                label = cand_aa + "★"
+
+            elif cand_aa != wt_aa and cand_aa in top3_set:
+                match_status = "MATCH_ESMC_TOP3"
+                score = 2
+                label = cand_aa + "✓"
+
+            elif cand_aa != wt_aa and top1_aa == wt_aa:
+                match_status = "MUTATION_WHILE_WT_IS_BEST"
+                score = -2
+                label = cand_aa + "×"
+
+            else:
+                match_status = "MUTATION_NOT_IN_ESMC_TOP3"
+                score = -1
+                label = cand_aa + "×"
+
+            candidate_rows.append({
+                "variant_name": variant_name,
+                "position_1based": pos,
+                "WT": wt_aa,
+                "candidate_AA": cand_aa,
+                "ESMC_top1_AA": top1_aa,
+                "ESMC_top3_set": top3_set,
+                "WT_rank": srow["WT_rank"],
+                "WT_prob": srow["WT_prob"],
+                "MUT_prob": mut_prob,
+                "LLR": llr,
+                "match_status": match_status,
+                "match_score": score,
+                "heatmap_label": label
+            })
+
+    candidate_match_df = pd.DataFrame(candidate_rows)
+
+    candidate_match_path = os.path.join(outdir, "esmc_candidate_sequence_match_table.csv")
+    candidate_match_df.to_csv(candidate_match_path, index=False)
+
+    # ------------------------------------------------------------
+    # Build full alignment-like matrix
+    # ------------------------------------------------------------
+
+    positions = list(range(1, len(wt_seq) + 1))
+    row_names = ["WT", "ESMC_top1"] + list(variants.keys())
+
+    label_matrix = []
+    score_matrix = []
+
+    # WT row
+    wt_labels = []
+    wt_scores = []
+
+    for pos in positions:
+        wt_aa = wt_seq[pos - 1]
+        top1_aa = suggestion_map.loc[pos, "top1_AA"]
+
+        wt_labels.append(wt_aa)
+
+        if top1_aa == wt_aa:
+            wt_scores.append(1)
+        else:
+            wt_scores.append(0)
+
+    label_matrix.append(wt_labels)
+    score_matrix.append(wt_scores)
+
+    # ESMC top1 row
+    esmc_labels = []
+    esmc_scores = []
+
+    for pos in positions:
+        wt_aa = wt_seq[pos - 1]
+        top1_aa = suggestion_map.loc[pos, "top1_AA"]
+
+        if top1_aa == wt_aa:
+            esmc_labels.append(top1_aa)
+            esmc_scores.append(1)
+        else:
+            esmc_labels.append(top1_aa + "★")
+            esmc_scores.append(3)
+
+    label_matrix.append(esmc_labels)
+    score_matrix.append(esmc_scores)
+
+    # Candidate rows
+    for variant_name, variant_seq in variants.items():
+        sub = candidate_match_df[
+            candidate_match_df["variant_name"] == variant_name
+        ].set_index("position_1based")
+
+        labels = []
+        scores = []
+
+        for pos in positions:
+            labels.append(sub.loc[pos, "heatmap_label"])
+            scores.append(sub.loc[pos, "match_score"])
+
+        label_matrix.append(labels)
+        score_matrix.append(scores)
+
+    label_df = pd.DataFrame(
+        label_matrix,
+        index=row_names,
+        columns=[str(p) for p in positions]
+    )
+
+    score_df = pd.DataFrame(
+        score_matrix,
+        index=row_names,
+        columns=[str(p) for p in positions]
+    )
+
+    label_path = os.path.join(outdir, "esmc_full_sequence_alignment_labels.csv")
+    score_path = os.path.join(outdir, "esmc_full_sequence_alignment_scores.csv")
+
+    label_df.to_csv(label_path)
+    score_df.to_csv(score_path)
+
+    # ------------------------------------------------------------
+    # Plot full heatmap
+    # ------------------------------------------------------------
+
+    n_rows, n_cols = score_df.shape
+
+    fig_w = max(18, n_cols * 0.24)
+    fig_h = max(4, n_rows * 0.48)
+
+    plt.figure(figsize=(fig_w, fig_h))
+
+    plt.imshow(
+        score_df.values.astype(float),
+        aspect="auto",
+        vmin=-2,
+        vmax=3
+    )
+
+    plt.colorbar(label="Match score")
+
+    plt.xticks(
+        ticks=range(n_cols),
+        labels=score_df.columns,
+        rotation=90
+    )
+
+    plt.yticks(
+        ticks=range(n_rows),
+        labels=score_df.index
+    )
+
+    if n_cols > 180:
+        font_size = 3
+    elif n_cols > 120:
+        font_size = 4
+    elif n_cols > 80:
+        font_size = 5
+    elif n_cols > 50:
+        font_size = 6
+    else:
+        font_size = 8
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            plt.text(
+                j,
+                i,
+                str(label_df.iloc[i, j]),
+                ha="center",
+                va="center",
+                fontsize=font_size
+            )
+
+    plt.xlabel("Position")
+    plt.ylabel("Sequence")
+    plt.title("ESMC Full Sequence Match Heatmap")
+    plt.tight_layout()
+
+    fig_path = os.path.join(figdir, "esmc_full_sequence_match_heatmap.png")
+    plt.savefig(fig_path, dpi=400)
+    plt.show()
+
+    print("\nSaved full sequence match heatmap outputs:")
+    print(suggestion_path)
+    print(candidate_match_path)
+    print(label_path)
+    print(score_path)
+    print(fig_path)
+
+
+# ============================================================
 # Output and display
 # ============================================================
 
@@ -579,6 +943,13 @@ def main():
         )
 
         print_variant_summary(summary_df, detail_df)
+
+        make_full_sequence_match_heatmap(
+            wt_seq=wt_seq,
+            variants=variants,
+            wt_scan_df=wt_scan_df,
+            detail_df=detail_df
+        )
 
         save_outputs(
             wt_scan_df=wt_scan_df,
